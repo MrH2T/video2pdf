@@ -21,12 +21,50 @@ DEFAULT_RESET_FRAMES = 2
 DEFAULT_RESIZE_WIDTH = 600
 DEFAULT_DEDUPE_PERCENT = 0.5
 DEFAULT_DEDUPE_PIXEL_THRESHOLD = 18
+DEFAULT_COLLAPSE_MONOTONIC_BUILD = False
+DEFAULT_MONOTONIC_MIN_ADD_PERCENT = 0.15
+DEFAULT_MONOTONIC_MAX_REMOVE_PERCENT = 0.03
+DEFAULT_MONOTONIC_MIN_CONTAINMENT = 0.97
 
 
 def frame_change_percent(gray_a, gray_b, pixel_threshold):
     diff = cv2.absdiff(gray_a, gray_b)
     _, binary = cv2.threshold(diff, pixel_threshold, 255, cv2.THRESH_BINARY)
     return (cv2.countNonZero(binary) / float(binary.shape[0] * binary.shape[1])) * 100
+
+
+def extract_content_mask(gray):
+    enhanced = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
+    _, global_mask = cv2.threshold(enhanced, 245, 255, cv2.THRESH_BINARY_INV)
+    adaptive_mask = cv2.adaptiveThreshold(
+        enhanced,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        31,
+        10,
+    )
+    mask = cv2.bitwise_or(global_mask, adaptive_mask)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+    return mask
+
+
+def monotonic_growth_stats(old_mask, new_mask):
+    old_count = cv2.countNonZero(old_mask)
+    new_count = cv2.countNonZero(new_mask)
+    if old_count == 0 or new_count == 0:
+        return 0.0, 0.0, 0.0
+
+    intersection = cv2.bitwise_and(old_mask, new_mask)
+    added = cv2.bitwise_and(new_mask, cv2.bitwise_not(old_mask))
+    removed = cv2.bitwise_and(old_mask, cv2.bitwise_not(new_mask))
+
+    total_pixels = float(old_mask.shape[0] * old_mask.shape[1])
+    containment = cv2.countNonZero(intersection) / float(old_count)
+    add_percent = (cv2.countNonZero(added) / total_pixels) * 100
+    remove_percent = (cv2.countNonZero(removed) / total_pixels) * 100
+    return containment, add_percent, remove_percent
 
 
 def preprocess_frame(frame, resize_width):
@@ -93,6 +131,8 @@ def detect_unique_screenshots(video_path, output_folder_screenshot_path, args):
     motion_count = 0
     stable_segment_saved = False
     last_saved_gray = None
+    last_saved_mask = None
+    last_saved_path = None
     candidate_orig = None
     candidate_gray = None
     candidate_time = 0.0
@@ -134,12 +174,41 @@ def detect_unique_screenshots(video_path, output_folder_screenshot_path, args):
                     is_new_scene = delta >= args.dedupe_percent
 
                 if is_new_scene and candidate_orig is not None:
-                    filename = f"{saved_count:03}_{candidate_time:.2f}s.png"
+                    candidate_mask = extract_content_mask(candidate_gray)
+
+                    replace_previous = False
+                    if (
+                        args.collapse_monotonic_build
+                        and last_saved_mask is not None
+                        and last_saved_path is not None
+                    ):
+                        containment, add_percent, remove_percent = monotonic_growth_stats(
+                            last_saved_mask,
+                            candidate_mask,
+                        )
+                        replace_previous = (
+                            containment >= args.monotonic_min_containment
+                            and add_percent >= args.monotonic_min_add_percent
+                            and remove_percent <= args.monotonic_max_remove_percent
+                        )
+
+                    target_index = saved_count - 1 if replace_previous and saved_count > 0 else saved_count
+                    filename = f"{target_index:03}_{candidate_time:.2f}s.png"
                     path = os.path.join(output_folder_screenshot_path, filename)
-                    print(f"saving {path}")
+
+                    if replace_previous and saved_count > 0:
+                        print(f"replacing {last_saved_path} -> {path}")
+                        if os.path.exists(last_saved_path) and last_saved_path != path:
+                            os.remove(last_saved_path)
+                    else:
+                        print(f"saving {path}")
+
                     cv2.imwrite(path, candidate_orig)
                     last_saved_gray = candidate_gray.copy()
-                    saved_count += 1
+                    last_saved_mask = candidate_mask.copy()
+                    last_saved_path = path
+                    if not replace_previous:
+                        saved_count += 1
                     stable_segment_saved = True
 
         elif diff_percent >= args.reset_motion_percent:
@@ -200,6 +269,30 @@ def parse_args():
     parser.add_argument("--resize-width", type=int, default=DEFAULT_RESIZE_WIDTH, help="working resize width")
     parser.add_argument("--dedupe-percent", type=float, default=DEFAULT_DEDUPE_PERCENT, help="minimum frame difference percent versus last saved slide")
     parser.add_argument("--dedupe-pixel-threshold", type=int, default=DEFAULT_DEDUPE_PIXEL_THRESHOLD, help="pixel diff threshold used for dedupe")
+    parser.add_argument(
+        "--collapse-monotonic-build",
+        action="store_true",
+        default=DEFAULT_COLLAPSE_MONOTONIC_BUILD,
+        help="when content only grows without real removal, keep only the latest frame in that sequence",
+    )
+    parser.add_argument(
+        "--monotonic-min-add-percent",
+        type=float,
+        default=DEFAULT_MONOTONIC_MIN_ADD_PERCENT,
+        help="minimum newly added content percent required to replace the previous saved frame",
+    )
+    parser.add_argument(
+        "--monotonic-max-remove-percent",
+        type=float,
+        default=DEFAULT_MONOTONIC_MAX_REMOVE_PERCENT,
+        help="maximum removed content percent allowed when collapsing a monotonic build sequence",
+    )
+    parser.add_argument(
+        "--monotonic-min-containment",
+        type=float,
+        default=DEFAULT_MONOTONIC_MIN_CONTAINMENT,
+        help="required containment of the previous saved content inside the new frame for monotonic collapsing",
+    )
     parser.add_argument("--progress-every", type=int, default=200, help="progress log interval in sampled frames")
     parser.add_argument("--auto-continue", action="store_true", help="skip manual confirmation and create pdf directly")
     return parser.parse_args()
