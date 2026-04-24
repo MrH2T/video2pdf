@@ -1,160 +1,227 @@
-import os
-import time
-import cv2
-import imutils
-import shutil
-import img2pdf
-import glob
 import argparse
+import glob
+import os
+import shutil
+import time
 
-############# Define constants
+import cv2
+import img2pdf
 
-OUTPUT_SLIDES_DIR = f"./output"
+OUTPUT_SLIDES_DIR = "./output"
 
-FRAME_RATE = 3                   # no.of frames per second that needs to be processed, fewer the count faster the speed
-WARMUP = FRAME_RATE              # initial number of frames to be skipped
-FGBG_HISTORY = FRAME_RATE * 15   # no.of frames in background object
-VAR_THRESHOLD = 16               # Threshold on the squared Mahalanobis distance between the pixel and the model to decide whether a pixel is well described by the background model.
-DETECT_SHADOWS = False            # If true, the algorithm will detect shadows and mark them.
-MIN_PERCENT = 0.1                # min % of diff between foreground and background to detect if motion has stopped
-MAX_PERCENT = 3                  # max % of diff between foreground and background to detect if frame is still in motion
+DEFAULT_SAMPLE_RATE = 6.0
+DEFAULT_WARMUP_SECONDS = 1.0
+DEFAULT_HISTORY_SECONDS = 6.0
+DEFAULT_VAR_THRESHOLD = 16
+DEFAULT_DETECT_SHADOWS = False
+DEFAULT_MIN_STILL_PERCENT = 0.35
+DEFAULT_RESET_MOTION_PERCENT = 0.9
+DEFAULT_MIN_STILL_FRAMES = 2
+DEFAULT_RESET_FRAMES = 2
+DEFAULT_RESIZE_WIDTH = 600
+DEFAULT_DEDUPE_PERCENT = 0.5
+DEFAULT_DEDUPE_PIXEL_THRESHOLD = 18
 
 
-def get_frames(video_path):
-    '''A fucntion to return the frames from a video located at video_path
-    this function skips frames as defined in FRAME_RATE'''
-    
-    
-    # open a pointer to the video file initialize the width and height of the frame
+def frame_change_percent(gray_a, gray_b, pixel_threshold):
+    diff = cv2.absdiff(gray_a, gray_b)
+    _, binary = cv2.threshold(diff, pixel_threshold, 255, cv2.THRESH_BINARY)
+    return (cv2.countNonZero(binary) / float(binary.shape[0] * binary.shape[1])) * 100
+
+
+def preprocess_frame(frame, resize_width):
+    processed = cv2.resize(
+        frame,
+        (resize_width, int(frame.shape[0] * (resize_width / float(frame.shape[1])))),
+        interpolation=cv2.INTER_AREA,
+    )
+    gray = cv2.cvtColor(processed, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+    return processed, gray
+
+
+def get_frames(video_path, sample_rate, warmup_seconds):
     vs = cv2.VideoCapture(video_path)
     if not vs.isOpened():
-        raise Exception(f'unable to open file {video_path}')
+        raise RuntimeError(f"unable to open file {video_path}")
 
+    source_fps = vs.get(cv2.CAP_PROP_FPS)
+    if source_fps <= 0:
+        source_fps = sample_rate
 
-    total_frames = vs.get(cv2.CAP_PROP_FRAME_COUNT)
-    frame_time = 0
-    frame_count = 0
-    print("total_frames: ", total_frames)
-    print("FRAME_RATE", FRAME_RATE)
+    frame_step = max(1, int(round(source_fps / sample_rate)))
+    warmup_frames = max(0, int(round(warmup_seconds * source_fps)))
+    total_frames = int(vs.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
 
-    # loop over the frames of the video
+    print("total_frames:", total_frames)
+    print("source_fps:", source_fps)
+    print("sample_rate:", sample_rate)
+    print("frame_step:", frame_step)
+
+    frame_index = -1
+    yielded_count = 0
+
     while True:
-        # grab a frame from the video
-
-        vs.set(cv2.CAP_PROP_POS_MSEC, frame_time * 1000)    # move frame to a timestamp
-        frame_time += 1/FRAME_RATE
-
-        (_, frame) = vs.read()
-        # if the frame is None, then we have reached the end of the video file
-        if frame is None:
+        ok, frame = vs.read()
+        if not ok or frame is None:
             break
 
-        frame_count += 1
-        yield frame_count, frame_time, frame
+        frame_index += 1
+        if frame_index < warmup_frames:
+            continue
+        if frame_index % frame_step != 0:
+            continue
+
+        frame_time = frame_index / float(source_fps)
+        yielded_count += 1
+        yield yielded_count, frame_index, frame_time, frame
 
     vs.release()
- 
 
 
-def detect_unique_screenshots(video_path, output_folder_screenshot_path):
-    ''''''
-    # Initialize fgbg a Background object with Parameters
-    # history = The number of frames history that effects the background subtractor
-    # varThreshold = Threshold on the squared Mahalanobis distance between the pixel and the model to decide whether a pixel is well described by the background model. This parameter does not affect the background update.
-    # detectShadows = If true, the algorithm will detect shadows and mark them. It decreases the speed a bit, so if you do not need this feature, set the parameter to false.
+def detect_unique_screenshots(video_path, output_folder_screenshot_path, args):
+    history = max(1, int(round(args.sample_rate * args.history_seconds)))
+    fgbg = cv2.createBackgroundSubtractorMOG2(
+        history=history,
+        varThreshold=args.var_threshold,
+        detectShadows=args.detect_shadows,
+    )
 
-    fgbg = cv2.createBackgroundSubtractorMOG2(history=FGBG_HISTORY, varThreshold=VAR_THRESHOLD,detectShadows=DETECT_SHADOWS)
-
-    
-    captured = False
     start_time = time.time()
-    (W, H) = (None, None)
+    saved_count = 0
+    stable_count = 0
+    motion_count = 0
+    stable_segment_saved = False
+    last_saved_gray = None
+    candidate_orig = None
+    candidate_gray = None
+    candidate_time = 0.0
+    candidate_frame_index = -1
+    last_diff_percent = None
 
-    screenshoots_count = 0
-    for frame_count, frame_time, frame in get_frames(video_path):
-        orig = frame.copy() # clone the original frame (so we can save it later), 
-        frame = imutils.resize(frame, width=600) # resize the frame
-        mask = fgbg.apply(frame) # apply the background subtractor
+    for sample_index, frame_index, frame_time, frame in get_frames(
+        video_path, args.sample_rate, args.warmup_seconds
+    ):
+        orig = frame.copy()
+        resized, gray = preprocess_frame(frame, args.resize_width)
+        mask = fgbg.apply(gray)
 
-        # apply a series of erosions and dilations to eliminate noise
-#            eroded_mask = cv2.erode(mask, None, iterations=2)
-#            mask = cv2.dilate(mask, None, iterations=2)
+        _, mask = cv2.threshold(mask, 200, 255, cv2.THRESH_BINARY)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
 
-        # if the width and height are empty, grab the spatial dimensions
-        if W is None or H is None:
-            (H, W) = mask.shape[:2]
+        height, width = mask.shape[:2]
+        diff_percent = (cv2.countNonZero(mask) / float(width * height)) * 100
+        last_diff_percent = diff_percent
 
-        # compute the percentage of the mask that is "foreground"
-        p_diff = (cv2.countNonZero(mask) / float(W * H)) * 100
+        if diff_percent <= args.min_still_percent:
+            stable_count += 1
+            motion_count = 0
+            candidate_orig = orig
+            candidate_gray = gray
+            candidate_time = frame_time
+            candidate_frame_index = frame_index
 
-        # if p_diff less than N% then motion has stopped, thus capture the frame
+            if stable_count >= args.min_still_frames and not stable_segment_saved:
+                is_new_scene = True
+                if last_saved_gray is not None and candidate_gray is not None:
+                    delta = frame_change_percent(
+                        last_saved_gray,
+                        candidate_gray,
+                        args.dedupe_pixel_threshold,
+                    )
+                    is_new_scene = delta >= args.dedupe_percent
 
-        if p_diff < MIN_PERCENT and not captured and frame_count > WARMUP:
-            captured = True
-            filename = f"{screenshoots_count:03}_{round(frame_time/60, 2)}.png"
+                if is_new_scene and candidate_orig is not None:
+                    filename = f"{saved_count:03}_{candidate_time:.2f}s.png"
+                    path = os.path.join(output_folder_screenshot_path, filename)
+                    print(f"saving {path}")
+                    cv2.imwrite(path, candidate_orig)
+                    last_saved_gray = candidate_gray.copy()
+                    saved_count += 1
+                    stable_segment_saved = True
 
-            path = os.path.join(output_folder_screenshot_path, filename)
-            print("saving {}".format(path))
-            cv2.imwrite(path, orig)
-            screenshoots_count += 1
+        elif diff_percent >= args.reset_motion_percent:
+            motion_count += 1
+            stable_count = 0
+            if motion_count >= args.reset_frames:
+                stable_segment_saved = False
+                candidate_orig = None
+                candidate_gray = None
+        else:
+            # 中间区域说明场景处于变化/过渡中，重置稳定计数，
+            # 但不立刻允许再次保存，等待明显进入“新稳定段”。
+            stable_count = 0
+            motion_count = 0
 
-        # otherwise, either the scene is changing or we're still in warmup
-        # mode so let's wait until the scene has settled or we're finished
-        # building the background model
-        elif captured and p_diff >= MAX_PERCENT:
-            captured = False
-    print(f'{screenshoots_count} screenshots Captured!')
-    print(f'Time taken {time.time()-start_time}s')
-    return 
+        if args.progress_every > 0 and sample_index % args.progress_every == 0:
+            print(
+                f"processed={sample_index}, time={frame_time:.1f}s, diff={diff_percent:.3f}%, saved={saved_count}"
+            )
+
+    print(f"{saved_count} screenshots captured!")
+    print(f"last diff percent: {last_diff_percent}")
+    print(f"time taken {time.time() - start_time:.2f}s")
 
 
 def initialize_output_folder(video_path):
-    '''Clean the output folder if already exists'''
-    output_folder_screenshot_path = f"{OUTPUT_SLIDES_DIR}/{video_path.rsplit('/')[-1].split('.')[0]}"
-
+    output_folder_screenshot_path = f"{OUTPUT_SLIDES_DIR}/{os.path.splitext(os.path.basename(video_path))[0]}"
     if os.path.exists(output_folder_screenshot_path):
         shutil.rmtree(output_folder_screenshot_path)
-
     os.makedirs(output_folder_screenshot_path, exist_ok=True)
-    print('initialized output folder', output_folder_screenshot_path)
+    print("initialized output folder", output_folder_screenshot_path)
     return output_folder_screenshot_path
 
 
-def convert_screenshots_to_pdf(output_folder_screenshot_path):
-    output_pdf_path = f"{OUTPUT_SLIDES_DIR}/{video_path.rsplit('/')[-1].split('.')[0]}" + '.pdf'
-    print('output_folder_screenshot_path', output_folder_screenshot_path)
-    print('output_pdf_path', output_pdf_path)
-    print('converting images to pdf..')
-    with open(output_pdf_path, "wb") as f:
-        f.write(img2pdf.convert(sorted(glob.glob(f"{output_folder_screenshot_path}/*.png"))))
-    print('Pdf Created!')
-    print('pdf saved at', output_pdf_path)
+def convert_screenshots_to_pdf(video_path, output_folder_screenshot_path):
+    output_pdf_path = f"{OUTPUT_SLIDES_DIR}/{os.path.splitext(os.path.basename(video_path))[0]}.pdf"
+    print("output_folder_screenshot_path", output_folder_screenshot_path)
+    print("output_pdf_path", output_pdf_path)
+    print("converting images to pdf..")
+    with open(output_pdf_path, "wb") as file_obj:
+        file_obj.write(img2pdf.convert(sorted(glob.glob(f"{output_folder_screenshot_path}/*.png"))))
+    print("PDF created!")
+    print("pdf saved at", output_pdf_path)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser("video_path")
+    parser.add_argument("video_path", help="path of video to be converted to pdf slides", type=str)
+    parser.add_argument("--sample-rate", type=float, default=DEFAULT_SAMPLE_RATE, help="frames per second to analyze")
+    parser.add_argument("--warmup-seconds", type=float, default=DEFAULT_WARMUP_SECONDS, help="initial seconds to skip")
+    parser.add_argument("--history-seconds", type=float, default=DEFAULT_HISTORY_SECONDS, help="background history in sampled seconds")
+    parser.add_argument("--var-threshold", type=float, default=DEFAULT_VAR_THRESHOLD, help="MOG2 variance threshold")
+    parser.add_argument("--detect-shadows", action="store_true", default=DEFAULT_DETECT_SHADOWS, help="enable MOG2 shadow detection")
+    parser.add_argument("--min-still-percent", type=float, default=DEFAULT_MIN_STILL_PERCENT, help="foreground percent below which a scene is considered stable")
+    parser.add_argument("--reset-motion-percent", type=float, default=DEFAULT_RESET_MOTION_PERCENT, help="foreground percent above which a new motion segment is recognized")
+    parser.add_argument("--min-still-frames", type=int, default=DEFAULT_MIN_STILL_FRAMES, help="consecutive stable sampled frames required before saving")
+    parser.add_argument("--reset-frames", type=int, default=DEFAULT_RESET_FRAMES, help="consecutive motion sampled frames required to allow a new save")
+    parser.add_argument("--resize-width", type=int, default=DEFAULT_RESIZE_WIDTH, help="working resize width")
+    parser.add_argument("--dedupe-percent", type=float, default=DEFAULT_DEDUPE_PERCENT, help="minimum frame difference percent versus last saved slide")
+    parser.add_argument("--dedupe-pixel-threshold", type=int, default=DEFAULT_DEDUPE_PIXEL_THRESHOLD, help="pixel diff threshold used for dedupe")
+    parser.add_argument("--progress-every", type=int, default=200, help="progress log interval in sampled frames")
+    parser.add_argument("--auto-continue", action="store_true", help="skip manual confirmation and create pdf directly")
+    return parser.parse_args()
 
 
 if __name__ == "__main__":
-    
-#     video_path = "./input/Test Video 2.mp4"
-#     choice = 'y'
-#     output_folder_screenshot_path = initialize_output_folder(video_path)
-    
-    
-    parser = argparse.ArgumentParser("video_path")
-    parser.add_argument("video_path", help="path of video to be converted to pdf slides", type=str)
-    args = parser.parse_args()
+    args = parse_args()
     video_path = args.video_path
 
-    print('video_path', video_path)
+    print("video_path", video_path)
     output_folder_screenshot_path = initialize_output_folder(video_path)
-    detect_unique_screenshots(video_path, output_folder_screenshot_path)
+    detect_unique_screenshots(video_path, output_folder_screenshot_path, args)
 
-    print('Please Manually verify screenshots and delete duplicates')
-    while True:
-        choice = input("Press y to continue and n to terminate")
-        choice = choice.lower().strip()
-        if choice in ['y', 'n']:
-            break
-        else:
-            print('please enter a valid choice')
+    if args.auto_continue:
+        convert_screenshots_to_pdf(video_path, output_folder_screenshot_path)
+    else:
+        print("Please manually verify screenshots and delete duplicates if needed")
+        while True:
+            choice = input("Press y to continue and n to terminate").lower().strip()
+            if choice in ["y", "n"]:
+                break
+            print("please enter a valid choice")
 
-    if choice == 'y':
-        convert_screenshots_to_pdf(output_folder_screenshot_path)
+        if choice == "y":
+            convert_screenshots_to_pdf(video_path, output_folder_screenshot_path)
